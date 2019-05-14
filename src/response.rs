@@ -2,11 +2,13 @@ use std::mem;
 use std::fmt;
 use std::io::{self, Read};
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::Context;
 use std::time::Duration;
 use std::borrow::Cow;
 
 use encoding_rs::{Encoding, UTF_8};
-use futures::{Async, Poll, Stream};
+use futures::{Poll, Stream};
 use http;
 use mime::Mime;
 use serde::de::DeserializeOwned;
@@ -402,12 +404,11 @@ struct WaitBody {
 }
 
 impl Stream for WaitBody {
-    type Item = <async_impl::Decoder as Stream>::Item;
-    type Error = <async_impl::Decoder as Stream>::Error;
+    type Item = Result<<Result<async_impl::Decoder, async_impl::Decoder>  as Stream>>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         match self.inner.next() {
-            Some(Ok(chunk)) => Ok(Async::Ready(Some(chunk))),
+            Some(Ok(chunk)) => Poll::Ready(Ok(Some(chunk))),
             Some(Err(e)) => {
                 let req_err = match e {
                     wait::Waited::TimedOut => ::error::timedout(None),
@@ -416,7 +417,7 @@ impl Stream for WaitBody {
 
                 Err(req_err)
             },
-            None => Ok(Async::Ready(None)),
+            None => Poll::Ready(Ok(None)),
         }
     }
 }

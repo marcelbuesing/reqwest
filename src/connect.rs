@@ -15,6 +15,8 @@ use bytes::BufMut;
 use std::io;
 use std::sync::Arc;
 use std::net::IpAddr;
+use std::pin::Pin;
+use std::task::Context;
 use std::time::Duration;
 
 #[cfg(feature = "trust-dns")]
@@ -385,7 +387,7 @@ pub(crate) trait AsyncConn: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite> AsyncConn for T {}
 pub(crate) type Conn = Box<dyn AsyncConn + Send + Sync + 'static>;
 
-pub(crate) type Connecting = Box<Future<Item=(Conn, Connected), Error=io::Error> + Send>;
+pub(crate) type Connecting = Box<Future<Output=Result<(Conn, Connected), io::Error>> + Send>;
 
 #[cfg(feature = "tls")]
 fn tunnel<T>(conn: T, host: String, port: u16, auth: Option<::http::header::HeaderValue>) -> Tunnel<T> {
@@ -432,10 +434,9 @@ impl<T> Future for Tunnel<T>
 where
     T: AsyncRead + AsyncWrite,
 {
-    type Item = T;
-    type Error = io::Error;
+    type Output = Result<T, io::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         loop {
             if let TunnelState::Writing = self.state {
                 let n = try_ready!(self.conn.as_mut().unwrap().write_buf(&mut self.buf));
@@ -443,23 +444,23 @@ where
                     self.state = TunnelState::Reading;
                     self.buf.get_mut().truncate(0);
                 } else if n == 0 {
-                    return Err(tunnel_eof());
+                    return Poll::Ready(Err(tunnel_eof()));
                 }
             } else {
                 let n = try_ready!(self.conn.as_mut().unwrap().read_buf(&mut self.buf.get_mut()));
                 let read = &self.buf.get_ref()[..];
                 if n == 0 {
-                    return Err(tunnel_eof());
+                    return Poll::Ready(Err(tunnel_eof()));
                 } else if read.len() > 12 {
                     if read.starts_with(b"HTTP/1.1 200") || read.starts_with(b"HTTP/1.0 200") {
                         if read.ends_with(b"\r\n\r\n") {
-                            return Ok(self.conn.take().unwrap().into());
+                            return Poll::Ready(Ok(self.conn.take().unwrap().into()));
                         }
                         // else read more
                     } else if read.starts_with(b"HTTP/1.1 407") {
-                        return Err(io::Error::new(io::ErrorKind::Other, "proxy authentication required"));
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "proxy authentication required")));
                     } else {
-                        return Err(io::Error::new(io::ErrorKind::Other, "unsuccessful tunnel"));
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "unsuccessful tunnel")));
                     }
                 }
             }
@@ -479,8 +480,10 @@ fn tunnel_eof() -> io::Error {
 #[cfg(feature = "default-tls")]
 mod native_tls_async {
     use std::io::{self, Read, Write};
+    use std::pin::Pin;
+    use std::task::Context;
 
-    use futures::{Poll, Future, Async};
+    use futures::{Poll, Future};
     use native_tls::{self, HandshakeError, Error, TlsConnector};
     use tokio_io::{AsyncRead, AsyncWrite};
 
@@ -556,8 +559,8 @@ mod native_tls_async {
     }
 
     impl<S: AsyncRead + AsyncWrite> AsyncWrite for TlsStream<S> {
-        fn shutdown(&mut self) -> Poll<(), io::Error> {
-            try_nb!(self.inner.shutdown());
+        fn shutdown(&mut self) -> Poll<Result<(), io::Error>> {
+            try_ready!(self.inner.shutdown());
             self.inner.get_mut().shutdown()
         }
     }
@@ -578,30 +581,28 @@ mod native_tls_async {
 
     // TODO: change this to AsyncRead/AsyncWrite on next major version
     impl<S: Read + Write> Future for ConnectAsync<S> {
-        type Item = TlsStream<S>;
-        type Error = Error;
+        type Output = Result<TlsStream<S>, Error>;
 
-        fn poll(&mut self) -> Poll<TlsStream<S>, Error> {
+        fn poll(&mut self) -> Poll<Output> {
             self.inner.poll()
         }
     }
 
     // TODO: change this to AsyncRead/AsyncWrite on next major version
     impl<S: Read + Write> Future for MidHandshake<S> {
-        type Item = TlsStream<S>;
-        type Error = Error;
+        type Output = Result<TlsStream<S>, Error>;
 
-        fn poll(&mut self) -> Poll<TlsStream<S>, Error> {
+        fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
             match self.inner.take().expect("cannot poll MidHandshake twice") {
-                Ok(stream) => Ok(TlsStream { inner: stream }.into()),
-                Err(HandshakeError::Failure(e)) => Err(e),
+                Ok(stream) => Poll::Ready(Ok(TlsStream { inner: stream }.into())),
+                Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
                 Err(HandshakeError::WouldBlock(s)) => {
                     match s.handshake() {
-                        Ok(stream) => Ok(TlsStream { inner: stream }.into()),
-                        Err(HandshakeError::Failure(e)) => Err(e),
+                        Ok(stream) => Poll::Ready(Ok(TlsStream { inner: stream }.into())),
+                        Err(HandshakeError::Failure(e)) => Poll::Ready(Err(e)),
                         Err(HandshakeError::WouldBlock(s)) => {
                             self.inner = Some(Err(HandshakeError::WouldBlock(s)));
-                            Ok(Async::NotReady)
+                            Poll::Pending
                         }
                     }
                 }

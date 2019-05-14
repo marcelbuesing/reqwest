@@ -24,10 +24,12 @@ use std::fmt;
 use std::mem;
 use std::cmp;
 use std::io::{self, Read};
+use std::pin::Pin;
+use std::task::Context;
 
 use bytes::{Buf, BufMut, BytesMut};
 use flate2::read::GzDecoder;
-use futures::{Async, Future, Poll, Stream};
+use futures::{Future, Poll, Stream};
 use hyper::{HeaderMap};
 use hyper::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING};
 
@@ -153,17 +155,16 @@ impl Decoder {
 }
 
 impl Stream for Decoder {
-    type Item = Chunk;
-    type Error = error::Error;
+    type Item = Result<Chunk, error::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         // Do a read or poll for a pendidng decoder value.
         let new_value = match self.inner {
             Inner::Pending(ref mut future) => {
                 match future.poll() {
-                    Ok(Async::Ready(inner)) => inner,
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(e) => return Err(e)
+                    Poll::Ready(Ok(inner)) => inner,
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e))
                 }
             },
             Inner::PlainText(ref mut body) => return body.poll(),
@@ -176,20 +177,19 @@ impl Stream for Decoder {
 }
 
 impl Future for Pending {
-    type Item = Inner;
-    type Error = error::Error;
+    type Output = Result<Inner, error::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let body_state = match self.body.poll_stream() {
-            Ok(Async::Ready(state)) => state,
-            Ok(Async::NotReady) => return Ok(Async::NotReady),
-            Err(e) => return Err(e)
+            Poll::Ready(Ok(state)) => state,
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => return Poll::Ready(None)
         };
 
         let body = mem::replace(&mut self.body, ReadableChunks::new(Body::empty()));
         match body_state {
-            StreamState::Eof => Ok(Async::Ready(Inner::PlainText(Body::empty()))),
-            StreamState::HasMore => Ok(Async::Ready(Inner::Gzip(Gzip::new(body))))
+            StreamState::Eof => Poll::Ready(Ok(Inner::PlainText(Body::empty()))),
+            StreamState::HasMore => Poll::Ready(Ok(Inner::Gzip(Gzip::new(body))))
         }
     }
 }
@@ -204,10 +204,9 @@ impl Gzip {
 }
 
 impl Stream for Gzip {
-    type Item = Chunk;
-    type Error = error::Error;
+    type Item = Result<Chunk, error::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if self.buf.remaining_mut() == 0 {
             self.buf.reserve(INIT_BUFFER_SIZE);
         }
@@ -229,18 +228,18 @@ impl Stream for Gzip {
             // See https://github.com/seanmonstar/reqwest/issues/508.
             let inner_read = try_io!(self.inner.get_mut().read(&mut [0]));
             if inner_read == 0 {
-                Ok(Async::Ready(None))
+                Poll::Ready(None)
             } else {
-                Err(error::from(io::Error::new(
+                Poll::Ready(Some(Err(error::from(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "unexpected data after gzip decoder signaled end-of-file",
-                )))
+                )))))
             }
         } else {
             unsafe { self.buf.advance_mut(read) };
             let chunk = Chunk::from_chunk(self.buf.split_to(read).freeze());
 
-            Ok(Async::Ready(Some(chunk)))
+            Poll::Ready(Some(Ok(chunk)))
         }
     }
 }
@@ -286,7 +285,7 @@ impl<S> fmt::Debug for ReadableChunks<S> {
 
 impl<S> Read for ReadableChunks<S>
 where
-    S: Stream<Item = Chunk, Error = error::Error>,
+    S: Stream<Item = Result<Chunk, error::Error>>,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -305,14 +304,14 @@ where
                 },
                 ReadState::NotReady => {
                     match self.poll_stream() {
-                        Ok(Async::Ready(StreamState::HasMore)) => continue,
-                        Ok(Async::Ready(StreamState::Eof)) => {
+                        Poll::Ready(Ok(StreamState::HasMore)) => continue,
+                        Poll::Ready(Ok(StreamState::Eof)) => {
                             return Ok(0)
                         },
-                        Ok(Async::NotReady) => {
+                        Poll::Pending => {
                             return Err(io::ErrorKind::WouldBlock.into())
                         },
-                        Err(e) => {
+                        Poll::Ready(Err(e)) => {
                             return Err(error::into_io(e))
                         }
                     }
@@ -326,28 +325,28 @@ where
 }
 
 impl<S> ReadableChunks<S>
-    where S: Stream<Item = Chunk, Error = error::Error>
+    where S: Stream<Item = Result<Chunk, error::Error>>
 {
     /// Poll the readiness of the inner reader.
     ///
     /// This function will update the internal state and return a simplified
     /// version of the `ReadState`.
-    fn poll_stream(&mut self) -> Poll<StreamState, error::Error> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<StreamState>> {
         match self.stream.poll() {
-            Ok(Async::Ready(Some(chunk))) => {
+            Poll::Ready(Some(Ok(chunk))) => {
                 self.state = ReadState::Ready(chunk);
 
-                Ok(Async::Ready(StreamState::HasMore))
+                Poll::Ready(Ok(StreamState::HasMore))
             },
-            Ok(Async::Ready(None)) => {
+            Poll::Ready(None) => {
                 self.state = ReadState::Eof;
 
-                Ok(Async::Ready(StreamState::Eof))
+                Poll::Ready(Ok(StreamState::Eof))
             },
-            Ok(Async::NotReady) => {
-                Ok(Async::NotReady)
+            Poll::Pending => {
+               Poll::Pending
             },
-            Err(e) => Err(e)
+            Poll::Ready(Some(Err((e)))) => Poll::Ready(Some(Err((e))))
         }
     }
 }

@@ -1,10 +1,12 @@
 use std::{fmt, str};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::pin::Pin;
+use std::task::Context;
 use std::net::IpAddr;
 
 use bytes::Bytes;
-use futures::{Async, Future, Poll};
+use futures::{Future, Poll};
 use header::{
     Entry,
     HeaderMap,
@@ -701,32 +703,30 @@ impl Pending {
 }
 
 impl Future for Pending {
-    type Item = Response;
-    type Error = ::Error;
+    type Output = Result<Response, ::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         match self.inner {
             PendingInner::Request(ref mut req) => req.poll(),
-            PendingInner::Error(ref mut err) => Err(err.take().expect("Pending error polled more than once")),
+            PendingInner::Error(ref mut err) => Poll::Ready(Err(err.take().expect("Pending error polled more than once"))),
         }
     }
 }
 
 impl Future for PendingRequest {
-    type Item = Response;
-    type Error = ::Error;
+    type Output = Result<Response, ::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         if let Some(ref mut delay) = self.timeout {
-            if let Async::Ready(()) = try_!(delay.poll(), &self.url) {
-                return Err(::error::timedout(Some(self.url.clone())));
+            if let Poll::Ready(Ok(())) = try_!(delay.poll(), &self.url) {
+                return Poll::Ready(Err(::error::timedout(Some(self.url.clone()))));
             }
         }
 
         loop {
             let res = match try_!(self.in_flight.poll(), &self.url) {
-                Async::Ready(res) => res,
-                Async::NotReady => return Ok(Async::NotReady),
+                Poll::Ready(res) => res,
+                Poll::Pending => return Poll::Pending,
             };
             if let Some(store_wrapper) = self.client.cookie_store.as_ref() {
                 let mut store = store_wrapper.write().unwrap();
@@ -830,16 +830,16 @@ impl Future for PendingRequest {
                             debug!("redirect_policy disallowed redirection to '{}'", loc);
                         },
                         redirect::Action::LoopDetected => {
-                            return Err(::error::loop_detected(self.url.clone()));
+                            return Poll::Ready(Err(::error::loop_detected(self.url.clone())));
                         },
                         redirect::Action::TooManyRedirects => {
-                            return Err(::error::too_many_redirects(self.url.clone()));
+                            return Poll::Ready(Err(::error::too_many_redirects(self.url.clone())));
                         }
                     }
                 }
             }
             let res = Response::new(res, self.url.clone(), self.client.gzip, self.timeout.take());
-            return Ok(Async::Ready(res));
+            return Poll::Ready(Ok(res));
         }
     }
 }

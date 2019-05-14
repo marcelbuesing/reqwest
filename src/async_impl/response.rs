@@ -3,7 +3,7 @@ use std::mem;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 
-use futures::{Async, Future, Poll, Stream};
+use futures::{Future, Poll, Stream};
 use futures::stream::Concat2;
 use http;
 use hyper::{HeaderMap, StatusCode, Version};
@@ -73,7 +73,7 @@ impl Response {
     }
 
     /// Retrieve the cookies contained in the response.
-    /// 
+    ///
     /// Note that invalid 'Set-Cookie' headers will be ignored.
     pub fn cookies<'a>(&'a self) -> impl Iterator<Item = cookie::Cookie<'a>> + 'a {
         cookie::extract_response_cookies(&self.headers)
@@ -245,12 +245,12 @@ pub struct Json<T> {
 }
 
 impl<T: DeserializeOwned> Future for Json<T> {
-    type Item = T;
-    type Error = ::Error;
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    type Output = Result<T, ::Error>;
+
+    fn poll(&mut self) -> Poll<Self::Output> {
         let bytes = try_ready!(self.concat.poll());
         let t = try_!(serde_json::from_slice(&bytes));
-        Ok(Async::Ready(t))
+        Poll::Ready(Ok(t))
     }
 }
 

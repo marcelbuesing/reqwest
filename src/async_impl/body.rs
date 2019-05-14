@@ -1,6 +1,8 @@
 use std::fmt;
+use std::pin::Pin;
+use std::task::Context;
 
-use futures::{Future, Stream, Poll, Async};
+use futures::{Future, Stream, Poll};
 use bytes::{Buf, Bytes};
 use hyper::body::Payload;
 use tokio::timer::Delay;
@@ -71,32 +73,31 @@ impl Body {
 }
 
 impl Stream for Body {
-    type Item = Chunk;
-    type Error = ::Error;
+    type Item = Result<Chunk, ::Error>;
 
     #[inline]
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let opt = match self.inner {
             Inner::Hyper { ref mut body, ref mut timeout } => {
                 if let Some(ref mut timeout) = timeout {
-                    if let Async::Ready(()) = try_!(timeout.poll()) {
-                        return Err(::error::timedout(None));
+                    if let Poll::Ready(()) = try_!(timeout.poll()) {
+                        return Poll::Ready(Err(::error::timedout(None)));
                     }
                 }
                 try_ready!(body.poll_data().map_err(::error::from))
             },
             Inner::Reusable(ref mut bytes) => {
                 return if bytes.is_empty() {
-                    Ok(Async::Ready(None))
+                    Poll::Ready(None)
                 } else {
                     let chunk = Chunk::from_chunk(bytes.clone());
                     *bytes = Bytes::new();
-                    Ok(Async::Ready(Some(chunk)))
+                    Poll::Ready(Some(Ok(chunk)))
                 };
             },
         };
 
-        Ok(Async::Ready(opt.map(|chunk| Chunk {
+        Poll::Ready(opt.map(|chunk| Ok(Chunk {
             inner: chunk,
         })))
     }
